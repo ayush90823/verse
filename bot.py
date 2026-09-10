@@ -3,6 +3,7 @@ import re
 import json
 import time
 import requests
+import subprocess
 from pyrogram import Client, filters
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
@@ -87,23 +88,39 @@ class ProgressTracker:
             pass
 
 
-def extract_episode_number(text: str):
-    if not text:
-        return None
-    match = re.search(r'(?:ep|episode|e)\s*[-:]?\s*(\d{1,4})', text, re.IGNORECASE)
-    if match:
-        return int(match.group(1))
-    if text.strip().isdigit():
-        return int(text.strip())
-    return None
-
-
 def extract_url(text: str):
     if not text:
         return None
     match = re.search(r'(https?://[^\s]+)', text)
     if match:
         return match.group(1)
+    return None
+
+
+def extract_episode_number(text: str, url: str = None):
+    """Text, Caption, ya URL ke ending filename se episode number dhoondhta hai."""
+    targets_to_search = []
+    
+    if text:
+        targets_to_search.append(text)
+    
+    if url:
+        # URL ke end part (filename/query parameters) ko inspect karte hain
+        clean_url = url.split("?")[0] # Query parameters alag karein
+        filename = clean_url.split("/")[-1]
+        targets_to_search.append(filename)
+        targets_to_search.append(url)
+
+    for target in targets_to_search:
+        # Match pattern: ep1, ep-01, episode 2, e03, s01e02, ep_05
+        match = re.search(r'(?:ep|episode|e|s\d+e)[-_\s:]?(\d{1,4})', target, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+
+        # Direct number match agar text me sirf digit ho
+        if target.strip().isdigit():
+            return int(target.strip())
+
     return None
 
 
@@ -128,30 +145,11 @@ def get_or_create_release():
     return resp.json()
 
 
-class ProgressFile:
-    def __init__(self, path, tracker: ProgressTracker):
-        self.file = open(path, "rb")
-        self.total_size = os.path.getsize(path)
-        self.uploaded = 0
-        self.tracker = tracker
-
-    def read(self, size=-1):
-        chunk = self.file.read(size)
-        self.uploaded += len(chunk)
-        self.tracker.update(self.uploaded, self.total_size)
-        return chunk
-
-    def __len__(self):
-        return self.total_size
-
-    def close(self):
-        self.file.close()
-
-
 def upload_to_github_release(local_path: str, filename: str, tracker: ProgressTracker) -> str:
+    """cURL command ka use karke 1080p SSL connection drops/errors ko bypass karta hai."""
     release = get_or_create_release()
     
-    # Pehle check karein agar same asset pehle se hai toh delete karein
+    # Existing duplicate asset ko delete karein
     assets_url = f"{GITHUB_API}/repos/{GITHUB_REPOSITORY}/releases/{release['id']}/assets"
     assets_resp = requests.get(assets_url, headers=GH_HEADERS)
     if assets_resp.status_code == 200:
@@ -162,26 +160,22 @@ def upload_to_github_release(local_path: str, filename: str, tracker: ProgressTr
 
     upload_url_template = release["upload_url"]
     upload_url = upload_url_template.split("{")[0] + f"?name={filename}"
-    headers = {**GH_HEADERS, "Content-Type": "application/octet-stream"}
 
-    max_attempts = 3
-    last_error = None
+    curl_command = [
+        "curl",
+        "-X", "POST",
+        "-H", f"Authorization: Bearer {GH_TOKEN}",
+        "-H", "Content-Type: application/octet-stream",
+        "-H", "Accept: application/vnd.github+json",
+        "--upload-file", local_path,
+        upload_url
+    ]
 
-    for attempt in range(1, max_attempts + 1):
-        pf = ProgressFile(local_path, tracker)
-        try:
-            resp = requests.post(upload_url, headers=headers, data=pf, timeout=600)
-            if resp.status_code in [200, 201]:
-                return f"{WORKER_BASE_URL.rstrip('/')}/watch/{filename}"
-            else:
-                last_error = f"Status {resp.status_code}: {resp.text}"
-        except Exception as e:
-            last_error = e
-            time.sleep(3 * attempt)
-        finally:
-            pf.close()
-
-    raise RuntimeError(f"Upload failed after {max_attempts} attempts: {last_error}")
+    try:
+        result = subprocess.run(curl_command, capture_output=True, text=True, check=True)
+        return f"{WORKER_BASE_URL.rstrip('/')}/watch/{filename}"
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"cURL Upload failed: {e.stderr}")
 
 
 def download_from_url(url: str, local_path: str, tracker: ProgressTracker):
@@ -237,8 +231,8 @@ def handle_setup(client, message):
         f"✅ **Setup Successful!**\n\n"
         f"🎬 **Anime:** `{slug}`\n"
         f"📌 **Season:** `{season}`\n\n"
-        f"Ab is episode ke **3 videos** forward karein.\n"
-        f"Caption me episode number hona zaroori hai (e.g. `ep 2`)."
+        f"Ab is episode ke **3 videos** ya **3 download links** bhej/forward karein.\n"
+        f"Bot link ya caption se automatic episode number detect kar lega!"
     )
 
 
@@ -249,13 +243,15 @@ def handle_incoming_media(client, message):
         return
 
     text_content = message.caption or message.text or ""
-    episode = extract_episode_number(text_content)
+    url = extract_url(text_content)
+    
+    # Episode number parsing (Text + URL dono me dhoondhta hai)
+    episode = extract_episode_number(text_content, url)
 
     if episode is None:
-        message.reply_text("⚠️ Episode number nahi mila! Caption/Text me `ep 2` zaroor likhein.")
+        message.reply_text("⚠️ Episode number nahi mila! Link ya Caption me `ep1`, `ep2`, ya `e02` zaroor hona chahiye.")
         return
 
-    url = extract_url(text_content)
     is_video = bool(message.video or message.document)
 
     if not is_video and not url:
@@ -296,7 +292,6 @@ def handle_incoming_media(client, message):
             status_msg = message.reply_text(f"⬇️ **Downloading TG Video ({idx}/3)...**")
             tracker = ProgressTracker(status_msg, f"⬇️ Downloading TG Video ({idx}/3)")
             
-            # Direct media download
             client.download_media(
                 message=msg,
                 file_name=local_path,
@@ -315,7 +310,6 @@ def handle_incoming_media(client, message):
         # Validating actual downloaded file size
         if os.path.exists(local_path):
             file_size = os.path.getsize(local_path)
-            # Validation: Video kam se kam 15 MB ki honi chahiye
             if file_size < 15 * 1024 * 1024:
                 message.reply_text(f"⚠️ Warning: File {idx} corrupt/chhoti hai ({human_size(file_size)}). Ignore kiya gaya.")
                 os.remove(local_path)
@@ -323,7 +317,7 @@ def handle_incoming_media(client, message):
                 downloaded_files.append({"path": local_path, "size": file_size})
 
     if len(downloaded_files) < 3:
-        message.reply_text("❌ Subhi 3 videos sahi se download nahi ho sake. Process Cancelled.")
+        message.reply_text("❌ Subhi 3 videos/links sahi se download nahi ho sake. Process Cancelled.")
         for f in downloaded_files:
             if os.path.exists(f["path"]):
                 os.remove(f["path"])
