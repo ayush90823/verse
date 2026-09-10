@@ -12,7 +12,7 @@ API_ID = int(os.environ.get("TG_API_ID", 0))
 API_HASH = os.environ.get("TG_API_HASH", "")
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 
-GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")  # Format: "username/repo-name"
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")  # "username/repo-name"
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 RELEASE_TAG = "episodes-store"
 
@@ -150,59 +150,51 @@ class ProgressFile:
 
 def upload_to_github_release(local_path: str, filename: str, tracker: ProgressTracker) -> str:
     release = get_or_create_release()
+    
+    # Pehle check karein agar same asset pehle se hai toh delete karein
+    assets_url = f"{GITHUB_API}/repos/{GITHUB_REPOSITORY}/releases/{release['id']}/assets"
+    assets_resp = requests.get(assets_url, headers=GH_HEADERS)
+    if assets_resp.status_code == 200:
+        for asset in assets_resp.json():
+            if asset.get("name") == filename:
+                requests.delete(f"{GITHUB_API}/repos/{GITHUB_REPOSITORY}/releases/assets/{asset['id']}", headers=GH_HEADERS)
+                time.sleep(1)
+
     upload_url_template = release["upload_url"]
     upload_url = upload_url_template.split("{")[0] + f"?name={filename}"
     headers = {**GH_HEADERS, "Content-Type": "application/octet-stream"}
 
-    max_attempts = 4
+    max_attempts = 3
     last_error = None
 
     for attempt in range(1, max_attempts + 1):
         pf = ProgressFile(local_path, tracker)
         try:
-            resp = requests.post(upload_url, headers=headers, data=pf, timeout=300)
-        except requests.exceptions.RequestException as e:
+            resp = requests.post(upload_url, headers=headers, data=pf, timeout=600)
+            if resp.status_code in [200, 201]:
+                return f"{WORKER_BASE_URL.rstrip('/')}/watch/{filename}"
+            else:
+                last_error = f"Status {resp.status_code}: {resp.text}"
+        except Exception as e:
             last_error = e
-            wait = 5 * attempt
-            try:
-                tracker.status_message.edit_text(
-                    f"⚠️ Network issue (Attempt {attempt}/{max_attempts}), "
-                    f"Retrying in {wait}s..."
-                )
-            except Exception:
-                pass
-            time.sleep(wait)
-            continue
+            time.sleep(3 * attempt)
         finally:
             pf.close()
-
-        if resp.status_code == 422:
-            assets_url = f"{GITHUB_API}/repos/{GITHUB_REPOSITORY}/releases/{release['id']}/assets"
-            assets = requests.get(assets_url, headers=GH_HEADERS).json()
-            if isinstance(assets, list):
-                for asset in assets:
-                    if asset.get("name") == filename:
-                        requests.delete(f"{GITHUB_API}/repos/{GITHUB_REPOSITORY}/releases/assets/{asset['id']}", headers=GH_HEADERS)
-            continue
-
-        if resp.status_code >= 500:
-            last_error = Exception(f"Server error {resp.status_code}")
-            time.sleep(5 * attempt)
-            continue
-
-        resp.raise_for_status()
-        return f"{WORKER_BASE_URL.rstrip('/')}/watch/{filename}"
 
     raise RuntimeError(f"Upload failed after {max_attempts} attempts: {last_error}")
 
 
 def download_from_url(url: str, local_path: str, tracker: ProgressTracker):
-    """Direct URL se video download karta hai chunk by chunk."""
-    res = requests.get(url, stream=True, timeout=60)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*"
+    }
+    res = requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=120)
     res.raise_for_status()
-    total_size = int(res.headers.get('content-length', 0))
     
+    total_size = int(res.headers.get('content-length', 0))
     downloaded = 0
+    
     with open(local_path, 'wb') as f:
         for chunk in res.iter_content(chunk_size=1024 * 1024):
             if chunk:
@@ -245,8 +237,8 @@ def handle_setup(client, message):
         f"✅ **Setup Successful!**\n\n"
         f"🎬 **Anime:** `{slug}`\n"
         f"📌 **Season:** `{season}`\n\n"
-        f"Ab is episode ke **3 videos** ya **3 download links** bhej/forward karein.\n"
-        f"Message/Caption ke end me episode number hona zaroori hai (e.g. `ep 2` ya `EP2`)."
+        f"Ab is episode ke **3 videos** forward karein.\n"
+        f"Caption me episode number hona zaroori hai (e.g. `ep 2`)."
     )
 
 
@@ -256,25 +248,24 @@ def handle_incoming_media(client, message):
         message.reply_text("⚠️ Pehle `/setup <anime-slug> <season-number>` command chalayein.")
         return
 
-    text_content = message.text or message.caption or ""
+    text_content = message.caption or message.text or ""
     episode = extract_episode_number(text_content)
 
     if episode is None:
-        message.reply_text("⚠️ Episode number nahi mila! Text/Caption ke aakhir me `ep 2` ya `EP2` zaroor likhein.")
+        message.reply_text("⚠️ Episode number nahi mila! Caption/Text me `ep 2` zaroor likhein.")
         return
 
     url = extract_url(text_content)
     is_video = bool(message.video or message.document)
 
     if not is_video and not url:
-        message.reply_text("⚠️ Message mein koi Video File ya Download Link nahi mila!")
+        message.reply_text("⚠️ Message mein Video ya Download Link nahi mila!")
         return
 
     slug = current_context["slug"]
     season = current_context["season"]
     key = (slug, season, episode)
 
-    # Payload construct karein (File ho ya Link)
     item = {
         "type": "telegram_file" if is_video else "direct_link",
         "message": message,
@@ -286,24 +277,31 @@ def handle_incoming_media(client, message):
 
     if count < 3:
         message.reply_text(
-            f"📥 Episode {episode} ({count}/3) received.\nBaaki {3 - count} item(s) aur bhejein."
+            f"📥 Episode {episode} ({count}/3) received.\nBaaki {3 - count} items aur bhejein."
         )
         return
 
-    # 3 Items mil chuke hain -> Process start
+    # 3 Items complete -> Processing
     items = pending_episodes.pop(key)
-    
-    # 1. First Download all 3 to local disk to check file sizes
     downloaded_files = []
-    
+
     for idx, item_data in enumerate(items, 1):
-        local_path = f"/tmp/temp_input_{idx}.mkv"
+        local_path = f"/tmp/input_file_{idx}.mp4"
         
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
         if item_data["type"] == "telegram_file":
             msg = item_data["message"]
-            status_msg = message.reply_text(f"⬇️ **Downloading TG File ({idx}/3)...**")
-            tracker = ProgressTracker(status_msg, f"⬇️ Downloading TG File ({idx}/3)")
-            client.download_media(msg, file_name=local_path, progress=tracker.update)
+            status_msg = message.reply_text(f"⬇️ **Downloading TG Video ({idx}/3)...**")
+            tracker = ProgressTracker(status_msg, f"⬇️ Downloading TG Video ({idx}/3)")
+            
+            # Direct media download
+            client.download_media(
+                message=msg,
+                file_name=local_path,
+                progress=tracker.update
+            )
         else:
             link = item_data["url"]
             status_msg = message.reply_text(f"⬇️ **Downloading Link ({idx}/3)...**")
@@ -311,27 +309,33 @@ def handle_incoming_media(client, message):
             try:
                 download_from_url(link, local_path, tracker)
             except Exception as e:
-                message.reply_text(f"❌ Link download failed: `{e}`")
+                message.reply_text(f"❌ Download failed for link {idx}: `{e}`")
                 continue
 
+        # Validating actual downloaded file size
         if os.path.exists(local_path):
             file_size = os.path.getsize(local_path)
-            downloaded_files.append({"path": local_path, "size": file_size})
+            # Validation: Video kam se kam 15 MB ki honi chahiye
+            if file_size < 15 * 1024 * 1024:
+                message.reply_text(f"⚠️ Warning: File {idx} corrupt/chhoti hai ({human_size(file_size)}). Ignore kiya gaya.")
+                os.remove(local_path)
+            else:
+                downloaded_files.append({"path": local_path, "size": file_size})
 
     if len(downloaded_files) < 3:
-        message.reply_text("❌ Teeno items sahi se download nahi ho paaye. Process cancelled.")
+        message.reply_text("❌ Subhi 3 videos sahi se download nahi ho sake. Process Cancelled.")
         for f in downloaded_files:
             if os.path.exists(f["path"]):
                 os.remove(f["path"])
         return
 
-    # 2. Sort by size (Smallest -> 480p, Medium -> 720p, Largest -> 1080p)
+    # Sort files by size
     downloaded_files.sort(key=lambda x: x["size"])
     quality_labels = ["480p", "720p", "1080p"]
     title = f"{slug.replace('-', ' ').title()} S{season:02d}E{episode:02d}"
     results = []
 
-    # 3. Rename & Upload to GitHub Release
+    # Upload to GitHub Releases
     for quality, file_info in zip(quality_labels, downloaded_files):
         src_path = file_info["path"]
         safe_name = f"{slug}-s{season:02d}e{episode:02d}-{quality}.mp4"
@@ -340,7 +344,7 @@ def handle_incoming_media(client, message):
         try:
             os.rename(src_path, final_local_path)
 
-            upload_status_msg = message.reply_text(f"⬆️ **Uploading ({quality}):** `{safe_name}`")
+            upload_status_msg = message.reply_text(f"⬆️ **Uploading ({quality}):** `{safe_name}`\nSize: `{human_size(file_info['size'])}`")
             upload_tracker = ProgressTracker(upload_status_msg, f"⬆️ Uploading ({quality})")
             streaming_url = upload_to_github_release(final_local_path, safe_name, upload_tracker)
 
@@ -366,7 +370,7 @@ def handle_incoming_media(client, message):
     message.reply_text(
         f"🎉 **Process Complete!**\n\n"
         f"📌 **Title:** {title}\n\n"
-        f"🔗 **Links Generated:**\n{summary}"
+        f"🔗 **Links:**\n{summary}"
     )
 
 
